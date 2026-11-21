@@ -1,0 +1,122 @@
+# MBloader - build otomatis (.levipack untuk LeviLauncher Android)
+#
+# Cara pakai lewat GitHub Web:
+#   1. Upload MBloader-Source.zip ke root repo (jangan di-extract).
+#   2. Buat file  .github/workflows/build-mbloader.yml  lalu tempel isi file ini.
+#   3. Buka tab Actions -> "Build MBloader" -> tunggu hijau -> download artifact "MBloader".
+# Workflow ini membongkar ZIP sendiri di runner, jadi tidak ada langkah extract terpisah.
+name: Build MBloader
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mbloader-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Siapkan source (dari ZIP atau dari repo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=""
+          for c in MBloader-Source.zip input/MBloader-Source.zip MBloader.zip input/MBloader.zip; do
+            if [ -f "$c" ]; then ZIP="$c"; break; fi
+          done
+          if [ -z "$ZIP" ]; then ZIP="$(find . -maxdepth 2 -iname '*mbloader*.zip' | head -n1 || true)"; fi
+          rm -rf _src
+          if [ -n "$ZIP" ]; then
+            echo "Memakai ZIP: $ZIP"
+            mkdir _src
+            unzip -q "$ZIP" -d _src
+          elif [ -f CMakeLists.txt ] && [ -d src ]; then
+            echo "Tidak ada ZIP, memakai source yang sudah ada di repo"
+            mkdir _src
+            tar --exclude=./_src --exclude=./.git -cf - . | (cd _src && tar -xf -)
+          else
+            echo "::error::MBloader-Source.zip tidak ditemukan di root repo"
+            exit 1
+          fi
+          ROOT="$(dirname "$(find _src -maxdepth 3 -name CMakeLists.txt | head -n1)")"
+          test -f "$ROOT/CMakeLists.txt" || { echo "::error::CMakeLists.txt tidak ada di dalam ZIP"; exit 1; }
+          echo "SRC_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Source di: $ROOT"
+          ls -la "$ROOT"
+
+      - name: Uji logika di host (tanpa Android)
+        shell: bash
+        working-directory: ${{ env.SRC_ROOT }}
+        run: |
+          set -euo pipefail
+          g++ -std=c++20 -Wall -Wextra -fsanitize=address,undefined -I src \
+            tests/host_test.cpp src/core/PackIndex.cpp -o /tmp/host_test
+          /tmp/host_test
+          g++ -std=c++20 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -rdynamic \
+            -I tests/stubs -I src tests/glue_test.cpp src/mod/MBloaderMod.cpp src/core/PackIndex.cpp -o /tmp/glue_test
+          /tmp/glue_test
+
+      - name: Pasang NDK r28c
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          add-to-path: false
+
+      - name: Pasang cmake dan ninja
+        run: sudo apt-get update -y && sudo apt-get install -y ninja-build cmake zip
+
+      - name: Build dan bungkus .levipack
+        shell: bash
+        working-directory: ${{ env.SRC_ROOT }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          bash scripts/package.sh
+
+      - name: Cek hasil build
+        shell: bash
+        working-directory: ${{ env.SRC_ROOT }}
+        run: |
+          set -euo pipefail
+          SO=dist/arm64-v8a/mbloader/libmbloader.so
+          ls -la dist/arm64-v8a dist/arm64-v8a/mbloader
+          file "$SO" | tee /tmp/file.txt
+          grep -q "ARM aarch64" /tmp/file.txt
+          unzip -l dist/arm64-v8a/mbloader.levipack
+          echo "--- simbol terekspor (dynsym) ---"
+          nm -D --defined-only "$SO" | head -n 40 || true
+
+      - name: Kumpulkan artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp "$SRC_ROOT/dist/arm64-v8a/mbloader.levipack" out/
+          cp -r "$SRC_ROOT/dist/arm64-v8a/mbloader" out/mbloader
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MBloader
+          path: out/
+          if-no-files-found: error
+
+      - name: Rilis (hanya untuk tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/mbloader.levipack
+          
